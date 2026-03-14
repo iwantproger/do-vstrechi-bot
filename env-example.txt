@@ -1,0 +1,8 @@
+# Telegram Bot Token (получи у @BotFather)
+BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+
+# URL бэкенд API (Railway/Render)
+BACKEND_API_URL=https://your-backend.railway.app
+
+# URL твоего Mini App (Vercel)
+MINI_APP_URL=https://your-app.vercel.app
