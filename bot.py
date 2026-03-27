@@ -1,360 +1,486 @@
-"""Telegram Bot — Schedule Booking App v1.1.0"""
-import os, logging
+"""
+Telegram Bot — До встречи v1.1
++ Inline режим
++ Без лишних эмодзи-стрелок
+"""
+
+import os
+import logging
+import traceback
 from datetime import datetime
 from typing import Optional
-import aiohttp
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InlineQueryResultArticle, InputTextMessageContent
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:8000")
 MINI_APP_URL    = os.getenv("MINI_APP_URL", "https://your-app.vercel.app")
 
-logger.info(f"Backend: {BACKEND_API_URL}")
-logger.info(f"Mini App: {MINI_APP_URL}")
+logger.info(f"BACKEND={BACKEND_API_URL} | MINI_APP={MINI_APP_URL}")
 
 bot     = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp      = Dispatcher(storage=storage)
 
+PLATFORM_NAMES = {
+    "jitsi":       "Jitsi Meet",
+    "google_meet": "Google Meet",
+    "zoom":        "Zoom",
+    "yandex":      "Яндекс.Телемост",
+    "mts":         "МТС Линк",
+}
 
-# ── FSM ──────────────────────────────────────────────────────
 
+# ───── FSM ─────
 class CreateSchedule(StatesGroup):
-    title    = State()
-    duration = State()
-    buffer   = State()
-    platform = State()
+    title   = State()
+    dur     = State()
+    buf     = State()
+    wstart  = State()
+    wend    = State()
+    plat    = State()
+    confirm = State()
 
 
-# ── API helper ───────────────────────────────────────────────
-
-async def api(method: str, path: str, data: Optional[dict] = None, params: Optional[dict] = None):
+# ───── API HELPER ─────
+async def api(method: str, path: str, data=None, params=None):
     url = BACKEND_API_URL + path
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession() as sess:
         try:
+            kw = dict(timeout=aiohttp.ClientTimeout(total=10))
             if method == "GET":
-                async with session.get(url, params=params) as r:
-                    return await r.json() if r.status in (200, 201) else None
+                async with sess.get(url, params=params, **kw) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    logger.warning(f"GET {path} {r.status}: {await r.text()}")
+                    return None
             elif method == "POST":
-                async with session.post(url, json=data) as r:
-                    return await r.json() if r.status in (200, 201) else None
-            elif method == "PATCH":
-                async with session.patch(url, json=data or {}) as r:
-                    return await r.json() if r.status == 200 else None
+                async with sess.post(url, json=data, **kw) as r:
+                    body = await r.json()
+                    if r.status in (200, 201):
+                        return body
+                    logger.warning(f"POST {path} {r.status}: {body}")
+                    return body
         except Exception as e:
             logger.error(f"API {method} {path}: {e}")
             return None
 
 
-# ── Keyboards ────────────────────────────────────────────────
-
-def main_keyboard():
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📅 Создать расписание")],
-        [KeyboardButton(text="📋 Мои встречи"), KeyboardButton(text="📊 Статистика")],
-        [KeyboardButton(text="❓ Помощь")],
+# ───── KEYBOARDS ─────
+def kb_main():
+    return types.ReplyKeyboardMarkup(keyboard=[
+        [types.KeyboardButton(text="Создать расписание")],
+        [types.KeyboardButton(text="Мои расписания"), types.KeyboardButton(text="Помощь")]
     ], resize_keyboard=True)
 
-
-# ── /start ───────────────────────────────────────────────────
-
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
-    user = message.from_user
-    resp = await api("POST", "/api/users/auth", {
-        "telegram_id": user.id, "username": user.username,
-        "first_name": user.first_name, "last_name": user.last_name,
-    })
-    is_new = resp.get("is_new", True) if resp else True
-    greeting = "Добро пожаловать!" if is_new else f"Привет снова, {user.first_name}!"
-    await message.answer(
-        f"👋 {greeting}\n\n"
-        "Я помогаю <b>создавать расписание встреч</b>.\n\n"
-        "<b>Как это работает:</b>\n"
-        "1️⃣ Создай расписание\n"
-        "2️⃣ Получи ссылку\n"
-        "3️⃣ Клиенты записываются сами\n"
-        "4️⃣ Получай уведомления\n\n"
-        "Начни: /create 👇",
-        parse_mode="HTML", reply_markup=main_keyboard(),
-    )
-
-
-# ── /help ────────────────────────────────────────────────────
-
-@dp.message(Command("help"))
-@dp.message(F.text == "❓ Помощь")
-async def cmd_help(message: types.Message):
-    await message.answer(
-        "📖 <b>Команды</b>\n\n"
-        "/create — Создать расписание\n"
-        "/meetings — Мои встречи\n"
-        "/stats — Статистика\n"
-        "/health — Проверить сервис\n"
-        "/help — Эта справка",
-        parse_mode="HTML",
-    )
-
-
-# ── CREATE SCHEDULE ──────────────────────────────────────────
-
-@dp.message(Command("create"))
-@dp.message(F.text == "📅 Создать расписание")
-async def cmd_create(message: types.Message, state: FSMContext):
-    await state.clear()
-    await state.update_data(telegram_id=message.from_user.id)
-    await message.answer(
-        "📝 <b>Создаём расписание</b>\n\nКак называется встреча?\n"
-        "<i>Например: Консультация, Тренировка, Собеседование</i>",
-        parse_mode="HTML", reply_markup=ReplyKeyboardRemove(),
-    )
-    await state.set_state(CreateSchedule.title)
-
-
-@dp.message(CreateSchedule.title)
-async def process_title(message: types.Message, state: FSMContext):
-    title = message.text.strip()
-    if len(title) < 2:
-        await message.answer("Название слишком короткое. Попробуй снова:"); return
-    await state.update_data(title=title)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def kb_dur():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="15 мин", callback_data="dur_15"),
          InlineKeyboardButton(text="30 мин", callback_data="dur_30")],
         [InlineKeyboardButton(text="45 мин", callback_data="dur_45"),
          InlineKeyboardButton(text="60 мин", callback_data="dur_60")],
         [InlineKeyboardButton(text="90 мин", callback_data="dur_90"),
-         InlineKeyboardButton(text="2 часа",  callback_data="dur_120")],
+         InlineKeyboardButton(text="120 мин", callback_data="dur_120")],
     ])
-    await message.answer(
-        f"✅ <b>{title}</b>\n\nСколько длится встреча?",
-        parse_mode="HTML", reply_markup=kb,
-    )
-    await state.set_state(CreateSchedule.duration)
 
-
-@dp.callback_query(F.data.startswith("dur_"), CreateSchedule.duration)
-async def process_duration(cb: types.CallbackQuery, state: FSMContext):
-    duration = int(cb.data.split("_")[1])
-    await state.update_data(duration=duration)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def kb_buf():
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Без перерыва", callback_data="buf_0"),
          InlineKeyboardButton(text="5 мин",  callback_data="buf_5")],
         [InlineKeyboardButton(text="10 мин", callback_data="buf_10"),
          InlineKeyboardButton(text="15 мин", callback_data="buf_15")],
         [InlineKeyboardButton(text="30 мин", callback_data="buf_30")],
     ])
-    await cb.message.edit_text(
-        f"⏱ <b>{duration} мин</b>\n\nПерерыв между встречами?",
-        parse_mode="HTML", reply_markup=kb,
-    )
-    await state.set_state(CreateSchedule.buffer)
-    await cb.answer()
 
-
-@dp.callback_query(F.data.startswith("buf_"), CreateSchedule.buffer)
-async def process_buffer(cb: types.CallbackQuery, state: FSMContext):
-    buffer = int(cb.data.split("_")[1])
-    await state.update_data(buffer_time=buffer)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎥 Jitsi Meet (бесплатно)", callback_data="plt_jitsi")],
-        [InlineKeyboardButton(text="📹 Google Meet",            callback_data="plt_google_meet")],
-        [InlineKeyboardButton(text="💼 Zoom",                   callback_data="plt_zoom")],
-        [InlineKeyboardButton(text="🦊 Яндекс.Телемост",        callback_data="plt_yandex")],
-        [InlineKeyboardButton(text="📡 МТС Линк",               callback_data="plt_mts")],
-        [InlineKeyboardButton(text="🔀 Клиент выбирает сам",    callback_data="plt_choice")],
+def kb_wstart():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="08:00", callback_data="whs_08:00"),
+         InlineKeyboardButton(text="09:00", callback_data="whs_09:00"),
+         InlineKeyboardButton(text="10:00", callback_data="whs_10:00")],
+        [InlineKeyboardButton(text="Ввести вручную", callback_data="whs_manual")],
     ])
-    buf_text = f"{buffer} мин" if buffer else "без перерыва"
-    await cb.message.edit_text(
-        f"🔄 Перерыв: <b>{buf_text}</b>\n\nГде проходят встречи?",
-        parse_mode="HTML", reply_markup=kb,
+
+def kb_wend():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="17:00", callback_data="whe_17:00"),
+         InlineKeyboardButton(text="18:00", callback_data="whe_18:00"),
+         InlineKeyboardButton(text="19:00", callback_data="whe_19:00")],
+        [InlineKeyboardButton(text="20:00", callback_data="whe_20:00"),
+         InlineKeyboardButton(text="Ввести вручную", callback_data="whe_manual")],
+    ])
+
+def kb_plat():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Jitsi Meet (бесплатно)", callback_data="pl_jitsi")],
+        [InlineKeyboardButton(text="Google Meet",           callback_data="pl_google_meet")],
+        [InlineKeyboardButton(text="Zoom",                  callback_data="pl_zoom")],
+        [InlineKeyboardButton(text="Яндекс.Телемост",       callback_data="pl_yandex")],
+        [InlineKeyboardButton(text="МТС Линк",              callback_data="pl_mts")],
+    ])
+
+
+# ───── /start ─────
+@dp.message(CommandStart())
+async def cmd_start(msg: types.Message):
+    u = msg.from_user
+    await api("POST", "/api/users/auth", {
+        "telegram_id": u.id, "username": u.username,
+        "first_name": u.first_name, "last_name": u.last_name,
+    })
+    await msg.answer(
+        f"Привет, <b>{u.first_name}</b>!\n\n"
+        "Я помогу организовать расписание встреч.\n\n"
+        "Создай расписание — и получи ссылку для клиентов.\n"
+        "Клиент открывает ссылку и сам выбирает время.\n\n"
+        "Начни с кнопки ниже:",
+        parse_mode="HTML",
+        reply_markup=kb_main()
     )
-    await state.set_state(CreateSchedule.platform)
+
+@dp.message(Command("help"))
+@dp.message(F.text == "Помощь")
+async def cmd_help(msg: types.Message):
+    await msg.answer(
+        "<b>Как это работает:</b>\n\n"
+        "1. Создай расписание — настрой слоты\n"
+        "2. Получи ссылку — отправь клиенту\n"
+        "3. Клиент открывает и выбирает время\n"
+        "4. Ты получаешь уведомление о записи\n\n"
+        "<b>Inline режим:</b>\n"
+        "Напиши <code>@do_vstrechi_bot</code> в любом чате — "
+        "появятся твои расписания. Нажми — отправишь ссылку собеседнику.\n\n"
+        "<b>Команды:</b>\n"
+        "/create — создать расписание\n"
+        "/schedules — мои расписания\n"
+        "/help — эта справка",
+        parse_mode="HTML"
+    )
+
+
+# ───── CREATE ─────
+@dp.message(Command("create"))
+@dp.message(F.text == "Создать расписание")
+async def cmd_create(msg: types.Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(telegram_id=msg.from_user.id)
+    await msg.answer(
+        "<b>Создаём расписание</b>\n\nКак назовём встречу?\n"
+        "Например: <i>Консультация</i>, <i>Собеседование</i>, <i>Сессия</i>",
+        parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.title)
+
+@dp.message(CreateSchedule.title)
+async def got_title(msg: types.Message, state: FSMContext):
+    t = msg.text.strip()
+    if len(t) < 2:
+        await msg.answer("Слишком короткое название. Минимум 2 символа.")
+        return
+    await state.update_data(title=t)
+    await msg.answer(
+        f"<b>{t}</b>\n\nСколько длится встреча?",
+        reply_markup=kb_dur(), parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.dur)
+
+@dp.callback_query(F.data.startswith("dur_"))
+async def got_dur(cb: types.CallbackQuery, state: FSMContext):
+    d = int(cb.data.split("_")[1])
+    await state.update_data(duration=d)
+    await cb.message.edit_text(
+        f"Длительность: <b>{d} мин</b>\n\nПеррыв между встречами?",
+        reply_markup=kb_buf(), parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.buf)
     await cb.answer()
 
+@dp.callback_query(F.data.startswith("buf_"))
+async def got_buf(cb: types.CallbackQuery, state: FSMContext):
+    b = int(cb.data.split("_")[1])
+    await state.update_data(buffer_time=b)
+    bt = f"{b} мин" if b else "без перерыва"
+    await cb.message.edit_text(
+        f"Перерыв: <b>{bt}</b>\n\nС какого часа принимаешь клиентов?",
+        reply_markup=kb_wstart(), parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.wstart)
+    await cb.answer()
 
-PLATFORM_NAMES = {
-    "jitsi": "Jitsi Meet", "google_meet": "Google Meet",
-    "zoom": "Zoom", "yandex": "Яндекс.Телемост", "mts": "МТС Линк",
-}
+@dp.callback_query(F.data.startswith("whs_"))
+async def got_wstart_cb(cb: types.CallbackQuery, state: FSMContext):
+    v = cb.data.split("_", 1)[1]
+    if v == "manual":
+        await cb.message.edit_text("Введи время начала (формат HH:MM, например 10:00):")
+        await state.set_state(CreateSchedule.wstart)
+        await cb.answer()
+        return
+    await state.update_data(work_hours_start=v)
+    await cb.message.edit_text(
+        f"Начало: <b>{v}</b>\n\nДо какого часа?",
+        reply_markup=kb_wend(), parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.wend)
+    await cb.answer()
 
-@dp.callback_query(F.data.startswith("plt_"), CreateSchedule.platform)
-async def process_platform(cb: types.CallbackQuery, state: FSMContext):
-    platform_raw  = cb.data.split("_", 1)[1]
-    is_choice     = (platform_raw == "choice")
-    platform      = "jitsi" if is_choice else platform_raw
-    location_mode = "user_choice" if is_choice else "fixed"
+@dp.message(CreateSchedule.wstart)
+async def got_wstart_txt(msg: types.Message, state: FSMContext):
+    v = msg.text.strip()
+    if not _vt(v):
+        await msg.answer("Неверный формат. Введи как HH:MM, например 09:30:")
+        return
+    await state.update_data(work_hours_start=v)
+    await msg.answer(f"Начало: <b>{v}</b>\n\nДо какого часа?", reply_markup=kb_wend(), parse_mode="HTML")
+    await state.set_state(CreateSchedule.wend)
 
-    await state.update_data(video_platform=platform, location_mode=location_mode)
-    await cb.message.edit_text("⏳ Создаю расписание...")
+@dp.callback_query(F.data.startswith("whe_"))
+async def got_wend_cb(cb: types.CallbackQuery, state: FSMContext):
+    v = cb.data.split("_", 1)[1]
+    if v == "manual":
+        await cb.message.edit_text("Введи время окончания (формат HH:MM, например 18:00):")
+        await state.set_state(CreateSchedule.wend)
+        await cb.answer()
+        return
+    await state.update_data(work_hours_end=v)
+    await cb.message.edit_text(
+        f"Конец: <b>{v}</b>\n\nГде будут встречи?",
+        reply_markup=kb_plat(), parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.plat)
+    await cb.answer()
 
-    data = await state.get_data()
-    resp = await api("POST", "/api/schedules", {
-        "telegram_id": data["telegram_id"], "title": data["title"],
-        "duration": data["duration"], "buffer_time": data["buffer_time"],
-        "work_hours_start": "09:00", "work_hours_end": "18:00",
-        "work_days": [0, 1, 2, 3, 4],
-        "video_platform": platform, "location_mode": location_mode,
-    })
+@dp.message(CreateSchedule.wend)
+async def got_wend_txt(msg: types.Message, state: FSMContext):
+    v = msg.text.strip()
+    if not _vt(v):
+        await msg.answer("Неверный формат. Введи как HH:MM, например 18:00:")
+        return
+    await state.update_data(work_hours_end=v)
+    await msg.answer(f"Конец: <b>{v}</b>\n\nГде будут встречи?", reply_markup=kb_plat(), parse_mode="HTML")
+    await state.set_state(CreateSchedule.plat)
 
-    if resp and "id" in resp:
-        booking_link  = f"{MINI_APP_URL}?schedule_id={resp['id']}"
-        plat_display  = "Клиент выбирает" if is_choice else PLATFORM_NAMES.get(platform, platform)
-        share_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📅 Открыть расписание", web_app=WebAppInfo(url=booking_link))],
-            [InlineKeyboardButton(text="📋 Показать ссылку", callback_data=f"showlink_{resp['id']}")],
-        ])
+@dp.callback_query(F.data.startswith("pl_"))
+async def got_plat(cb: types.CallbackQuery, state: FSMContext):
+    pl = cb.data.split("_", 1)[1]
+    await state.update_data(video_platform=pl)
+    d = await state.get_data()
+    pn = PLATFORM_NAMES.get(pl, pl)
+    bt = f"{d['buffer_time']} мин" if d['buffer_time'] else "нет"
+    await cb.message.edit_text(
+        f"<b>Проверь данные:</b>\n\n"
+        f"Название: <b>{d['title']}</b>\n"
+        f"Длительность: <b>{d['duration']} мин</b>\n"
+        f"Перерыв: <b>{bt}</b>\n"
+        f"Часы: <b>{d.get('work_hours_start','09:00')} — {d.get('work_hours_end','18:00')}</b>\n"
+        f"Дни: <b>Пн–Пт</b>\n"
+        f"Платформа: <b>{pn}</b>\n\n"
+        f"Всё верно?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Создать", callback_data="do_create"),
+             InlineKeyboardButton(text="Заново",  callback_data="restart")]
+        ]),
+        parse_mode="HTML"
+    )
+    await state.set_state(CreateSchedule.confirm)
+    await cb.answer()
+
+@dp.callback_query(F.data == "restart")
+async def do_restart(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("Начнём заново. Как назовём встречу?")
+    await state.set_state(CreateSchedule.title)
+    await cb.answer()
+
+@dp.callback_query(F.data == "do_create")
+async def do_create(cb: types.CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("Создаю расписание...")
+    d = await state.get_data()
+    payload = {
+        "telegram_id":      d["telegram_id"],
+        "title":            d["title"],
+        "duration":         d["duration"],
+        "buffer_time":      d["buffer_time"],
+        "work_hours_start": d.get("work_hours_start", "09:00"),
+        "work_hours_end":   d.get("work_hours_end",   "18:00"),
+        "work_days":        [0, 1, 2, 3, 4],
+        "video_platform":   d["video_platform"],
+        "location_mode":    "fixed",
+    }
+    r = await api("POST", "/api/schedules", payload)
+    if r and "id" in r:
+        link = f"{MINI_APP_URL}?schedule_id={r['id']}"
+        pn = PLATFORM_NAMES.get(d["video_platform"], d["video_platform"])
+        bt = f"{d['buffer_time']} мин" if d['buffer_time'] else "нет"
         await cb.message.edit_text(
-            f"✅ <b>Расписание создано!</b>\n\n"
-            f"📋 {data['title']}\n"
-            f"⏱ {data['duration']} мин · перерыв {data['buffer_time']} мин\n"
-            f"🕐 09:00–18:00, Пн–Пт\n"
-            f"🎥 {plat_display}\n\n"
-            f"🔗 <b>Ссылка для клиентов:</b>\n<code>{booking_link}</code>\n\n"
-            f"Отправь клиенту — он выберет время сам!",
-            parse_mode="HTML", reply_markup=share_kb,
+            f"Расписание создано!\n\n"
+            f"<b>{d['title']}</b>\n"
+            f"{d['duration']} мин · перерыв {bt}\n"
+            f"{d.get('work_hours_start','09:00')}–{d.get('work_hours_end','18:00')} · Пн–Пт\n"
+            f"{pn}\n\n"
+            f"Ссылка для клиентов:\n<code>{link}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="Открыть расписание",
+                    web_app=WebAppInfo(url=link)
+                )],
+                [InlineKeyboardButton(text="Мои расписания", callback_data="show_scheds")],
+            ]),
+            parse_mode="HTML"
         )
     else:
+        err = r.get("detail", "Неизвестная ошибка") if r else "Нет ответа от сервера"
         await cb.message.edit_text(
-            "❌ <b>Не удалось создать расписание</b>\n\nПопробуй: /create",
-            parse_mode="HTML",
+            f"Ошибка при создании расписания\n\n{err}\n\nПопробуй ещё раз: /create",
+            parse_mode="HTML"
         )
-
     await state.clear()
     await cb.answer()
-    await bot.send_message(cb.from_user.id, "Главное меню 👇", reply_markup=main_keyboard())
 
 
-@dp.callback_query(F.data.startswith("showlink_"))
-async def show_link(cb: types.CallbackQuery):
-    schedule_id = cb.data.split("_", 1)[1]
-    link = f"{MINI_APP_URL}?schedule_id={schedule_id}"
-    await cb.answer(f"Ссылка:\n{link}", show_alert=True)
+# ───── MY SCHEDULES ─────
+@dp.message(Command("schedules"))
+@dp.message(F.text == "Мои расписания")
+@dp.callback_query(F.data == "show_scheds")
+async def cmd_schedules(event):
+    msg = event.message if hasattr(event, "message") else event
+    uid = event.from_user.id
+    r = await api("GET", "/api/schedules", params={"telegram_id": uid})
+    scheds = r.get("schedules", []) if r else []
+    if not scheds:
+        text = "У тебя пока нет расписаний.\n\nСоздай первое: /create"
+    else:
+        lines = ["<b>Твои расписания:</b>\n"]
+        for s in scheds:
+            link = f"{MINI_APP_URL}?schedule_id={s['id']}"
+            pn = PLATFORM_NAMES.get(s.get("video_platform", ""), "")
+            lines.append(
+                f"📌 <b>{s['title']}</b>\n"
+                f"   {s['duration']} мин · {s.get('work_hours_start','09:00')}–{s.get('work_hours_end','18:00')}\n"
+                f"   {pn}\n"
+                f"   <code>{link}</code>\n"
+            )
+        text = "\n".join(lines)
+    if hasattr(event, "message"):
+        await event.message.answer(text, parse_mode="HTML")
+        await event.answer()
+    else:
+        await msg.answer(text, parse_mode="HTML")
 
 
-# ── MY MEETINGS ──────────────────────────────────────────────
-
+# ───── INCOMING BOOKINGS ─────
 @dp.message(Command("meetings"))
-@dp.message(F.text == "📋 Мои встречи")
-async def cmd_meetings(message: types.Message):
-    resp = await api("GET", "/api/bookings", params={"telegram_id": message.from_user.id})
-    if not resp or not resp.get("bookings"):
-        await message.answer(
-            "📭 <b>Встреч пока нет</b>\n\nСоздай расписание: /create",
-            parse_mode="HTML",
-        ); return
-
+async def cmd_meetings(msg: types.Message):
+    r = await api("GET", "/api/bookings", params={"telegram_id": msg.from_user.id})
+    bookings = r.get("bookings", []) if r else []
+    org = [b for b in bookings if b.get("organizer_telegram_id") == msg.from_user.id and b.get("status") != "cancelled"]
+    if not org:
+        await msg.answer("Пока нет записей от клиентов.\n\nПоделись ссылкой на расписание: /schedules")
+        return
     now = datetime.now()
-    upcoming, past = [], []
-    for b in resp["bookings"]:
-        try:
-            dt = datetime.fromisoformat(b["scheduled_time"].replace("Z", ""))
-        except Exception:
-            dt = now
-        (upcoming if dt > now and b.get("status") not in ("cancelled",) else past).append((dt, b))
-
-    upcoming.sort(key=lambda x: x[0])
-    past.sort(key=lambda x: x[0], reverse=True)
-
-    icons = {"confirmed": "✅", "pending": "⏳", "cancelled": "❌", "completed": "✓"}
-    text = ""
-
-    if upcoming:
-        text += "📅 <b>Предстоящие:</b>\n\n"
-        for dt, b in upcoming[:5]:
-            icon = icons.get(b.get("status", ""), "📌")
-            text += (f"{icon} <b>{b.get('meeting_title') or 'Встреча'}</b>\n"
-                     f"   👤 {b.get('guest_name','—')} · {dt.strftime('%d.%m %H:%M')}\n\n")
-
-    if past:
-        text += "📋 <b>Прошедшие:</b>\n\n"
-        for dt, b in past[:3]:
-            icon = icons.get(b.get("status", ""), "✓")
-            text += f"{icon} {b.get('meeting_title') or 'Встреча'} · {b.get('guest_name','—')} · {dt.strftime('%d.%m')}\n"
-
-    if not text:
-        text = "📭 Нет встреч"
-
-    # Кнопки для pending
-    buttons = []
-    for dt, b in upcoming:
-        if b.get("status") == "pending":
-            label = f"{b.get('meeting_title','Встреча')} ({b.get('guest_name','—')}) {dt.strftime('%d.%m %H:%M')}"
-            buttons.append([
-                InlineKeyboardButton(text=f"✅ Подтвердить", callback_data=f"confirm_{b['id']}"),
-                InlineKeyboardButton(text=f"❌ Отклонить",   callback_data=f"decline_{b['id']}"),
-            ])
-            text += f"\n⏳ Ожидает: <b>{label}</b>"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+    lines = ["<b>Входящие записи:</b>\n"]
+    em_map = {"confirmed": "✅", "pending": "⏳", "pending_organizer_approval": "⏳",
+              "cancelled": "❌", "completed": "✓"}
+    for b in sorted(org, key=lambda x: x.get("scheduled_time", ""))[:10]:
+        dt = datetime.fromisoformat(b["scheduled_time"].replace("Z", ""))
+        em = em_map.get(b.get("status", ""), "•")
+        ttl = b.get("meeting_title") or "Встреча"
+        lines.append(f"{em} {dt.strftime('%d.%m %H:%M')} — {b.get('guest_name','?')} ({ttl})")
+    await msg.answer("\n".join(lines), parse_mode="HTML")
 
 
-@dp.callback_query(F.data.startswith("confirm_"))
-async def confirm_meeting(cb: types.CallbackQuery):
-    resp = await api("PATCH", f"/api/bookings/{cb.data.split('_',1)[1]}/confirm")
-    await cb.answer("✅ Встреча подтверждена!" if resp else "❌ Ошибка", show_alert=True)
-    if resp:
-        await cb.message.edit_reply_markup(reply_markup=None)
+# ───── INLINE MODE ─────
+@dp.inline_query()
+async def inline_query(query: types.InlineQuery):
+    uid = query.from_user.id
+    q = query.query.strip().lower()
 
+    r = await api("GET", "/api/schedules", params={"telegram_id": uid})
+    scheds = r.get("schedules", []) if r else []
 
-@dp.callback_query(F.data.startswith("decline_"))
-async def decline_meeting(cb: types.CallbackQuery):
-    resp = await api("PATCH", f"/api/bookings/{cb.data.split('_',1)[1]}/cancel")
-    await cb.answer("Встреча отклонена" if resp else "Ошибка", show_alert=True)
-    if resp:
-        await cb.message.edit_reply_markup(reply_markup=None)
+    if q:
+        scheds = [s for s in scheds if q in s.get("title", "").lower()]
 
+    results = []
+    for sch in scheds[:10]:
+        link = f"{MINI_APP_URL}?schedule_id={sch['id']}"
+        pn = PLATFORM_NAMES.get(sch.get("video_platform", ""), "")
+        dur = sch.get("duration", 30)
+        wstart = sch.get("work_hours_start", "09:00")
+        wend   = sch.get("work_hours_end",   "18:00")
 
-# ── STATS ────────────────────────────────────────────────────
-
-@dp.message(Command("stats"))
-@dp.message(F.text == "📊 Статистика")
-async def cmd_stats(message: types.Message):
-    resp = await api("GET", "/api/stats", params={"telegram_id": message.from_user.id})
-    if resp:
-        await message.answer(
-            f"📊 <b>Статистика</b>\n\n"
-            f"📋 Всего: <b>{resp.get('total', 0)}</b>\n"
-            f"📅 Предстоящих: <b>{resp.get('upcoming', 0)}</b>\n"
-            f"✓ Завершённых: <b>{resp.get('completed', 0)}</b>",
-            parse_mode="HTML",
+        results.append(
+            InlineQueryResultArticle(
+                id=sch["id"],
+                title=sch["title"],
+                description=f"{dur} мин · {wstart}–{wend}{' · ' + pn if pn else ''}",
+                input_message_content=InputTextMessageContent(
+                    message_text=(
+                        f"Запись на встречу\n\n"
+                        f"<b>{sch['title']}</b>\n"
+                        f"Длительность: {dur} мин\n"
+                        f"Платформа: {pn}\n\n"
+                        f"Выбери удобное время по кнопке ниже:"
+                    ),
+                    parse_mode="HTML"
+                ),
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(
+                        text="Выбрать время и записаться",
+                        url=link
+                    )]
+                ])
+            )
         )
-    else:
-        await message.answer("📊 Статистика временно недоступна")
+
+    if not results:
+        results.append(
+            InlineQueryResultArticle(
+                id="empty",
+                title="Нет расписаний" if not q else "Ничего не найдено",
+                description="Создайте расписание через /create",
+                input_message_content=InputTextMessageContent(
+                    message_text="Создайте расписание: @do_vstrechi_bot → /create"
+                )
+            )
+        )
+
+    await query.answer(results, cache_time=30, is_personal=True)
 
 
-@dp.message(Command("health"))
-async def cmd_health(message: types.Message):
-    resp = await api("GET", "/health")
-    if resp:
-        icon = "✅" if resp.get("status") == "healthy" else "❌"
-        await message.answer(f"{icon} Backend: <b>{resp.get('status')}</b>\nDB: {resp.get('supabase')}", parse_mode="HTML")
-    else:
-        await message.answer("❌ Backend недоступен")
+# ───── UTILS ─────
+def _vt(s):
+    try: datetime.strptime(s, "%H:%M"); return True
+    except ValueError: return False
 
 
-# ── MAIN ─────────────────────────────────────────────────────
-
+# ───── MAIN ─────
 async def main():
     logger.info("Starting bot...")
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Bot is running!")
+    # Set commands
+    await bot.set_my_commands([
+        types.BotCommand(command="start",     description="Начать работу"),
+        types.BotCommand(command="create",    description="Создать расписание"),
+        types.BotCommand(command="schedules", description="Мои расписания"),
+        types.BotCommand(command="meetings",  description="Входящие записи"),
+        types.BotCommand(command="help",      description="Помощь"),
+    ])
+    logger.info("Bot running!")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     import asyncio
